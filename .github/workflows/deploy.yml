@@ -1,0 +1,90 @@
+name: Build and Deploy to Production
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+env:
+  SERVICE_NAME: cli-proxy-api
+  DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+
+jobs:
+  build-and-push:
+    name: Build and Push to Docker Hub
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Generate Build Metadata
+        run: |
+          echo VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "dev") >> $GITHUB_ENV
+          echo COMMIT=$(git rev-parse --short HEAD) >> $GITHUB_ENV
+          echo BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) >> $GITHUB_ENV
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            VERSION=${{ env.VERSION }}
+            COMMIT=${{ env.COMMIT }}
+            BUILD_DATE=${{ env.BUILD_DATE }}
+          tags: |
+            ${{ env.DOCKERHUB_USERNAME }}/${{ env.SERVICE_NAME }}:latest
+            ${{ env.DOCKERHUB_USERNAME }}/${{ env.SERVICE_NAME }}:${{ github.sha }}
+
+  deploy:
+    name: Deploy to Production Server
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read and Encode docker-compose
+        id: read_file
+        run: echo "content=$(base64 -w0 docker-compose.prod.yml)" >> $GITHUB_OUTPUT
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SSH_PORT }}
+          script: |
+            set -e
+            TARGET_DIR="/home/vetgo/cicd/app_services/repo/${{ env.SERVICE_NAME }}"
+            DATA_DIR="/data/apps/${{ env.SERVICE_NAME }}"
+
+            # Tạo cấu trúc thư mục theo quy chuẩn VetGo
+            mkdir -p "$TARGET_DIR"
+            mkdir -p "$DATA_DIR/logs"
+
+            # Decode docker-compose.prod.yml
+            echo "${{ steps.read_file.outputs.content }}" | base64 -d > "$TARGET_DIR/docker-compose.prod.yml"
+
+            # Tạo file .env
+            cd "$TARGET_DIR"
+            cat << EOF > .env
+            DOCKERHUB_USERNAME=${{ env.DOCKERHUB_USERNAME }}
+            SERVICE_NAME=${{ env.SERVICE_NAME }}
+            MANAGEMENT_PASSWORD=${{ secrets.MANAGEMENT_PASSWORD }}
+            OBJECTSTORE_ENDPOINT=${{ secrets.OBJECTSTORE_ENDPOINT }}
+            OBJECTSTORE_BUCKET=${{ secrets.OBJECTSTORE_BUCKET }}
+            OBJECTSTORE_ACCESS_KEY=${{ secrets.OBJECTSTORE_ACCESS_KEY }}
+            OBJECTSTORE_SECRET_KEY=${{ secrets.OBJECTSTORE_SECRET_KEY }}
+            EOF
+
+            # Pull và deploy
+            docker-compose --env-file .env -f docker-compose.prod.yml pull
+            docker-compose --env-file .env -f docker-compose.prod.yml up -d --remove-orphans
+            docker image prune -f
+            echo "✅ Deployment successful!"
