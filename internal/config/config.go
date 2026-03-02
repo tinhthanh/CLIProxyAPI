@@ -69,6 +69,9 @@ type Config struct {
 
 	// RequestRetry defines the retry times when the request failed.
 	RequestRetry int `yaml:"request-retry" json:"request-retry"`
+	// MaxRetryCredentials defines the maximum number of credentials to try for a failed request.
+	// Set to 0 or a negative value to keep trying all available credentials (legacy behavior).
+	MaxRetryCredentials int `yaml:"max-retry-credentials" json:"max-retry-credentials"`
 	// MaxRetryInterval defines the maximum wait time in seconds before retrying a cooled-down credential.
 	MaxRetryInterval int `yaml:"max-retry-interval" json:"max-retry-interval"`
 
@@ -89,6 +92,10 @@ type Config struct {
 
 	// ClaudeKey defines a list of Claude API key configurations as specified in the YAML configuration file.
 	ClaudeKey []ClaudeKey `yaml:"claude-api-key" json:"claude-api-key"`
+
+	// ClaudeHeaderDefaults configures default header values for Claude API requests.
+	// These are used as fallbacks when the client does not send its own headers.
+	ClaudeHeaderDefaults ClaudeHeaderDefaults `yaml:"claude-header-defaults" json:"claude-header-defaults"`
 
 	// OpenAICompatibility defines OpenAI API compatibility configurations for external providers.
 	OpenAICompatibility []OpenAICompatibility `yaml:"openai-compatibility" json:"openai-compatibility"`
@@ -115,6 +122,15 @@ type Config struct {
 	Payload PayloadConfig `yaml:"payload" json:"payload"`
 
 	legacyMigrationPending bool `yaml:"-" json:"-"`
+}
+
+// ClaudeHeaderDefaults configures default header values injected into Claude API requests
+// when the client does not send them. Update these when Claude Code releases a new version.
+type ClaudeHeaderDefaults struct {
+	UserAgent      string `yaml:"user-agent" json:"user-agent"`
+	PackageVersion string `yaml:"package-version" json:"package-version"`
+	RuntimeVersion string `yaml:"runtime-version" json:"runtime-version"`
+	Timeout        string `yaml:"timeout" json:"timeout"`
 }
 
 // TLSConfig holds HTTPS server settings.
@@ -288,6 +304,10 @@ type CloakConfig struct {
 	// SensitiveWords is a list of words to obfuscate with zero-width characters.
 	// This can help bypass certain content filters.
 	SensitiveWords []string `yaml:"sensitive-words,omitempty" json:"sensitive-words,omitempty"`
+
+	// CacheUserID controls whether Claude user_id values are cached per API key.
+	// When false, a fresh random user_id is generated for every request.
+	CacheUserID *bool `yaml:"cache-user-id,omitempty" json:"cache-user-id,omitempty"`
 }
 
 // ClaudeKey represents the configuration for a Claude API key,
@@ -354,6 +374,9 @@ type CodexKey struct {
 	// BaseURL is the base URL for the Codex API endpoint.
 	// If empty, the default Codex API URL will be used.
 	BaseURL string `yaml:"base-url" json:"base-url"`
+
+	// Websockets enables the Responses API websocket transport for this credential.
+	Websockets bool `yaml:"websockets,omitempty" json:"websockets,omitempty"`
 
 	// ProxyURL overrides the global proxy setting for this API key if provided.
 	ProxyURL string `yaml:"proxy-url" json:"proxy-url"`
@@ -493,16 +516,6 @@ func LoadConfig(configFile string) (*Config, error) {
 // If optional is true and the file is missing, it returns an empty Config.
 // If optional is true and the file is empty or invalid, it returns an empty Config.
 func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
-	// NOTE: Startup oauth-model-alias migration is intentionally disabled.
-	// Reason: avoid mutating config.yaml during server startup.
-	// Re-enable the block below if automatic startup migration is needed again.
-	// if migrated, err := MigrateOAuthModelAlias(configFile); err != nil {
-	// 	// Log warning but don't fail - config loading should still work
-	// 	fmt.Printf("Warning: oauth-model-alias migration failed: %v\n", err)
-	// } else if migrated {
-	// 	fmt.Println("Migrated oauth-model-mappings to oauth-model-alias")
-	// }
-
 	// Read the entire configuration file into memory.
 	data, err := os.ReadFile(configFile)
 	if err != nil {
@@ -589,8 +602,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		cfg.ErrorLogsMaxFiles = 10
 	}
 
-	// Sync request authentication providers with inline API keys for backwards compatibility.
-	syncInlineAccessProvider(&cfg)
+	if cfg.MaxRetryCredentials < 0 {
+		cfg.MaxRetryCredentials = 0
+	}
 
 	// Sanitize Gemini API key configuration and migrate legacy entries.
 	cfg.SanitizeGeminiKeys()
@@ -825,18 +839,6 @@ func normalizeModelPrefix(prefix string) string {
 	return trimmed
 }
 
-func syncInlineAccessProvider(cfg *Config) {
-	if cfg == nil {
-		return
-	}
-	if len(cfg.APIKeys) == 0 {
-		if provider := cfg.ConfigAPIKeyProvider(); provider != nil && len(provider.APIKeys) > 0 {
-			cfg.APIKeys = append([]string(nil), provider.APIKeys...)
-		}
-	}
-	cfg.Access.Providers = nil
-}
-
 // looksLikeBcrypt returns true if the provided string appears to be a bcrypt hash.
 func looksLikeBcrypt(s string) bool {
 	return len(s) > 4 && (s[:4] == "$2a$" || s[:4] == "$2b$" || s[:4] == "$2y$")
@@ -924,7 +926,7 @@ func hashSecret(secret string) (string, error) {
 // SaveConfigPreserveComments writes the config back to YAML while preserving existing comments
 // and key ordering by loading the original file into a yaml.Node tree and updating values in-place.
 func SaveConfigPreserveComments(configFile string, cfg *Config) error {
-	persistCfg := sanitizeConfigForPersist(cfg)
+	persistCfg := cfg
 	// Load original YAML as a node tree to preserve comments and ordering.
 	data, err := os.ReadFile(configFile)
 	if err != nil {
@@ -990,16 +992,6 @@ func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 	data = NormalizeCommentIndentation(buf.Bytes())
 	_, err = f.Write(data)
 	return err
-}
-
-func sanitizeConfigForPersist(cfg *Config) *Config {
-	if cfg == nil {
-		return nil
-	}
-	clone := *cfg
-	clone.SDKConfig = cfg.SDKConfig
-	clone.SDKConfig.Access = AccessConfig{}
-	return &clone
 }
 
 // SaveConfigPreserveCommentsUpdateNestedScalar updates a nested scalar key path like ["a","b"]
@@ -1098,8 +1090,13 @@ func getOrCreateMapValue(mapNode *yaml.Node, key string) *yaml.Node {
 
 // mergeMappingPreserve merges keys from src into dst mapping node while preserving
 // key order and comments of existing keys in dst. New keys are only added if their
-// value is non-zero to avoid polluting the config with defaults.
-func mergeMappingPreserve(dst, src *yaml.Node) {
+// value is non-zero and not a known default to avoid polluting the config with defaults.
+func mergeMappingPreserve(dst, src *yaml.Node, path ...[]string) {
+	var currentPath []string
+	if len(path) > 0 {
+		currentPath = path[0]
+	}
+
 	if dst == nil || src == nil {
 		return
 	}
@@ -1113,16 +1110,19 @@ func mergeMappingPreserve(dst, src *yaml.Node) {
 		sk := src.Content[i]
 		sv := src.Content[i+1]
 		idx := findMapKeyIndex(dst, sk.Value)
+		childPath := appendPath(currentPath, sk.Value)
 		if idx >= 0 {
 			// Merge into existing value node (always update, even to zero values)
 			dv := dst.Content[idx+1]
-			mergeNodePreserve(dv, sv)
+			mergeNodePreserve(dv, sv, childPath)
 		} else {
-			// New key: only add if value is non-zero to avoid polluting config with defaults
-			if isZeroValueNode(sv) {
+			// New key: only add if value is non-zero and not a known default
+			candidate := deepCopyNode(sv)
+			pruneKnownDefaultsInNewNode(childPath, candidate)
+			if isKnownDefaultValue(childPath, candidate) {
 				continue
 			}
-			dst.Content = append(dst.Content, deepCopyNode(sk), deepCopyNode(sv))
+			dst.Content = append(dst.Content, deepCopyNode(sk), candidate)
 		}
 	}
 }
@@ -1130,7 +1130,12 @@ func mergeMappingPreserve(dst, src *yaml.Node) {
 // mergeNodePreserve merges src into dst for scalars, mappings and sequences while
 // reusing destination nodes to keep comments and anchors. For sequences, it updates
 // in-place by index.
-func mergeNodePreserve(dst, src *yaml.Node) {
+func mergeNodePreserve(dst, src *yaml.Node, path ...[]string) {
+	var currentPath []string
+	if len(path) > 0 {
+		currentPath = path[0]
+	}
+
 	if dst == nil || src == nil {
 		return
 	}
@@ -1139,7 +1144,7 @@ func mergeNodePreserve(dst, src *yaml.Node) {
 		if dst.Kind != yaml.MappingNode {
 			copyNodeShallow(dst, src)
 		}
-		mergeMappingPreserve(dst, src)
+		mergeMappingPreserve(dst, src, currentPath)
 	case yaml.SequenceNode:
 		// Preserve explicit null style if dst was null and src is empty sequence
 		if dst.Kind == yaml.ScalarNode && dst.Tag == "!!null" && len(src.Content) == 0 {
@@ -1162,7 +1167,7 @@ func mergeNodePreserve(dst, src *yaml.Node) {
 				dst.Content[i] = deepCopyNode(src.Content[i])
 				continue
 			}
-			mergeNodePreserve(dst.Content[i], src.Content[i])
+			mergeNodePreserve(dst.Content[i], src.Content[i], currentPath)
 			if dst.Content[i] != nil && src.Content[i] != nil &&
 				dst.Content[i].Kind == yaml.MappingNode && src.Content[i].Kind == yaml.MappingNode {
 				pruneMissingMapKeys(dst.Content[i], src.Content[i])
@@ -1202,6 +1207,94 @@ func findMapKeyIndex(mapNode *yaml.Node, key string) int {
 		}
 	}
 	return -1
+}
+
+// appendPath appends a key to the path, returning a new slice to avoid modifying the original.
+func appendPath(path []string, key string) []string {
+	if len(path) == 0 {
+		return []string{key}
+	}
+	newPath := make([]string, len(path)+1)
+	copy(newPath, path)
+	newPath[len(path)] = key
+	return newPath
+}
+
+// isKnownDefaultValue returns true if the given node at the specified path
+// represents a known default value that should not be written to the config file.
+// This prevents non-zero defaults from polluting the config.
+func isKnownDefaultValue(path []string, node *yaml.Node) bool {
+	// First check if it's a zero value
+	if isZeroValueNode(node) {
+		return true
+	}
+
+	// Match known non-zero defaults by exact dotted path.
+	if len(path) == 0 {
+		return false
+	}
+
+	fullPath := strings.Join(path, ".")
+
+	// Check string defaults
+	if node.Kind == yaml.ScalarNode && node.Tag == "!!str" {
+		switch fullPath {
+		case "pprof.addr":
+			return node.Value == DefaultPprofAddr
+		case "remote-management.panel-github-repository":
+			return node.Value == DefaultPanelGitHubRepository
+		case "routing.strategy":
+			return node.Value == "round-robin"
+		}
+	}
+
+	// Check integer defaults
+	if node.Kind == yaml.ScalarNode && node.Tag == "!!int" {
+		switch fullPath {
+		case "error-logs-max-files":
+			return node.Value == "10"
+		}
+	}
+
+	return false
+}
+
+// pruneKnownDefaultsInNewNode removes default-valued descendants from a new node
+// before it is appended into the destination YAML tree.
+func pruneKnownDefaultsInNewNode(path []string, node *yaml.Node) {
+	if node == nil {
+		return
+	}
+
+	switch node.Kind {
+	case yaml.MappingNode:
+		filtered := make([]*yaml.Node, 0, len(node.Content))
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			keyNode := node.Content[i]
+			valueNode := node.Content[i+1]
+			if keyNode == nil || valueNode == nil {
+				continue
+			}
+
+			childPath := appendPath(path, keyNode.Value)
+			if isKnownDefaultValue(childPath, valueNode) {
+				continue
+			}
+
+			pruneKnownDefaultsInNewNode(childPath, valueNode)
+			if (valueNode.Kind == yaml.MappingNode || valueNode.Kind == yaml.SequenceNode) &&
+				len(valueNode.Content) == 0 {
+				continue
+			}
+
+			filtered = append(filtered, keyNode, valueNode)
+		}
+		node.Content = filtered
+	case yaml.SequenceNode:
+		for _, child := range node.Content {
+			pruneKnownDefaultsInNewNode(path, child)
+		}
+	}
 }
 
 // isZeroValueNode returns true if the YAML node represents a zero/default value
@@ -1457,9 +1550,6 @@ func pruneMappingToGeneratedKeys(dstRoot, srcRoot *yaml.Node, key string) {
 	srcIdx := findMapKeyIndex(srcRoot, key)
 	if srcIdx < 0 {
 		// Keep an explicit empty mapping for oauth-model-alias when it was previously present.
-		//
-		// Rationale: LoadConfig runs MigrateOAuthModelAlias before unmarshalling. If the
-		// oauth-model-alias key is missing, migration will add the default antigravity aliases.
 		// When users delete the last channel from oauth-model-alias via the management API,
 		// we want that deletion to persist across hot reloads and restarts.
 		if key == "oauth-model-alias" {
