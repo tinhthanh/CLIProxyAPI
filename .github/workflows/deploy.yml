@@ -1,4 +1,12 @@
-name: Build and Deploy to Production
+# Build and Deploy to Dev (GitOps)
+#
+# Flow:
+#   1. Push to main → build Docker image with :latest
+#   2. ArgoCD auto-pulls :latest for dev-apps namespace
+#   3. Optional: rollout restart to pick up new image faster
+#
+name: Build and Deploy to Dev
+
 on:
   push:
     branches: ["main"]
@@ -6,11 +14,11 @@ on:
 
 env:
   SERVICE_NAME: cli-proxy-api
-  DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+  DOCKERHUB_REPO: tinhthanh/cli-proxy-api
 
 jobs:
   build-and-push:
-    name: Build and Push to Docker Hub
+    name: Build and Push Docker Image
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -38,53 +46,19 @@ jobs:
             COMMIT=${{ env.COMMIT }}
             BUILD_DATE=${{ env.BUILD_DATE }}
           tags: |
-            ${{ env.DOCKERHUB_USERNAME }}/${{ env.SERVICE_NAME }}:latest
-            ${{ env.DOCKERHUB_USERNAME }}/${{ env.SERVICE_NAME }}:${{ github.sha }}
+            ${{ env.DOCKERHUB_REPO }}:latest
+            ${{ env.DOCKERHUB_REPO }}:${{ github.sha }}
 
-  deploy:
-    name: Deploy to Production Server
-    needs: build-and-push
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Read and Encode docker-compose
-        id: read_file
-        run: echo "content=$(base64 -w0 docker-compose.prod.yml)" >> $GITHUB_OUTPUT
-
-      - name: Deploy via SSH
-        uses: appleboy/ssh-action@master
-        with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USERNAME }}
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
-          port: ${{ secrets.SSH_PORT }}
-          script: |
-            set -e
-            TARGET_DIR="/home/vetgo/cicd/app_services/repo/${{ env.SERVICE_NAME }}"
-            DATA_DIR="/data/apps/${{ env.SERVICE_NAME }}"
-
-            # Tạo cấu trúc thư mục theo quy chuẩn VetGo
-            mkdir -p "$TARGET_DIR"
-            mkdir -p "$DATA_DIR/logs"
-
-            # Decode docker-compose.prod.yml
-            echo "${{ steps.read_file.outputs.content }}" | base64 -d > "$TARGET_DIR/docker-compose.prod.yml"
-
-            # Tạo file .env
-            cd "$TARGET_DIR"
-            cat << EOF > .env
-            DOCKERHUB_USERNAME=${{ env.DOCKERHUB_USERNAME }}
-            SERVICE_NAME=${{ env.SERVICE_NAME }}
-            MANAGEMENT_PASSWORD=${{ secrets.MANAGEMENT_PASSWORD }}
-            OBJECTSTORE_ENDPOINT=${{ secrets.OBJECTSTORE_ENDPOINT }}
-            OBJECTSTORE_BUCKET=${{ secrets.OBJECTSTORE_BUCKET }}
-            OBJECTSTORE_ACCESS_KEY=${{ secrets.OBJECTSTORE_ACCESS_KEY }}
-            OBJECTSTORE_SECRET_KEY=${{ secrets.OBJECTSTORE_SECRET_KEY }}
-            EOF
-
-            # Pull và deploy
-            docker-compose --env-file .env -f docker-compose.prod.yml pull
-            docker-compose --env-file .env -f docker-compose.prod.yml up -d --remove-orphans
-            docker image prune -f
-            echo "✅ Deployment successful!"
+      - name: Summary
+        run: |
+          echo "### 🐳 Docker Image Published" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Image** | \`${{ env.DOCKERHUB_REPO }}:latest\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **SHA Tag** | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Version** | \`${{ env.VERSION }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Dev** (\`proxy-dev.vetgo.tech\`) will auto-update via ArgoCD." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "To promote to UAT/Prod, run the [Promote workflow](https://github.com/tinhthanh/vetgo-infra/actions/workflows/promote.yml) on **vetgo-infra** repo." >> $GITHUB_STEP_SUMMARY
